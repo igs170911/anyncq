@@ -15,7 +15,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gocql/gocql"
 	"github.com/hibiken/asynq/internal/base"
+	"github.com/hibiken/asynq/internal/cdb"
 	"github.com/hibiken/asynq/internal/log"
 	"github.com/hibiken/asynq/internal/rdb"
 	"github.com/redis/go-redis/v9"
@@ -433,8 +435,9 @@ func NewServer(r RedisConnOpt, cfg Config) *Server {
 	if !ok {
 		panic(fmt.Sprintf("asynq: unsupported RedisConnOpt type %T", r))
 	}
-	server := NewServerFromRedisClient(redisClient, cfg)
-	server.sharedConnection = false
+	rdbBroker := rdb.NewRDB(redisClient)
+	// NewServer creates the connection, so sharedConnection is false.
+	server := NewServerWithBroker(rdbBroker, cfg, false)
 	return server
 }
 
@@ -442,6 +445,26 @@ func NewServer(r RedisConnOpt, cfg Config) *Server {
 // and server configuration
 // Warning: The underlying redis connection pool will not be closed by Asynq, you are responsible for closing it.
 func NewServerFromRedisClient(c redis.UniversalClient, cfg Config) *Server {
+	rdbBroker := rdb.NewRDB(c)
+	return NewServerWithBroker(rdbBroker, cfg, true)
+}
+
+// NewServerFromCassandraSession returns a new instance of Server given a gocql.Session
+// and server configuration.
+// Warning: The underlying Cassandra session will not be closed by Asynq;
+// you are responsible for closing it.
+func NewServerFromCassandraSession(session *gocql.Session, cfg Config) *Server {
+	if session == nil {
+		panic("asynq: cassandra session cannot be nil")
+	}
+	cassandraBroker := cdb.NewCDB(session)
+	return NewServerWithBroker(cassandraBroker, cfg, true)
+}
+
+// NewServerWithBroker returns a new instance of Server given a broker, server configuration,
+// and a boolean indicating whether the broker connection is shared.
+// This is the primary internal constructor.
+func NewServerWithBroker(b base.Broker, cfg Config, sharedConn bool) *Server {
 	baseCtxFn := cfg.BaseContext
 	if baseCtxFn == nil {
 		baseCtxFn = context.Background
@@ -503,7 +526,7 @@ func NewServerFromRedisClient(c redis.UniversalClient, cfg Config) *Server {
 	}
 	logger.SetLevel(toInternalLogLevel(loglevel))
 
-	rdb := rdb.NewRDB(c)
+	// rdb := rdb.NewRDB(c) // Broker 'b' is now passed in
 	starting := make(chan *workerInfo)
 	finished := make(chan *base.TaskMessage)
 	syncCh := make(chan *syncRequest)
@@ -517,7 +540,7 @@ func NewServerFromRedisClient(c redis.UniversalClient, cfg Config) *Server {
 	})
 	heartbeater := newHeartbeater(heartbeaterParams{
 		logger:         logger,
-		broker:         rdb,
+		broker:         b, // Use generic broker 'b'
 		interval:       5 * time.Second,
 		concurrency:    n,
 		queues:         queues,
@@ -532,18 +555,18 @@ func NewServerFromRedisClient(c redis.UniversalClient, cfg Config) *Server {
 	}
 	forwarder := newForwarder(forwarderParams{
 		logger:   logger,
-		broker:   rdb,
+		broker:   b, // Use generic broker 'b'
 		queues:   qnames,
 		interval: delayedTaskCheckInterval,
 	})
 	subscriber := newSubscriber(subscriberParams{
 		logger:       logger,
-		broker:       rdb,
+		broker:       b, // Use generic broker 'b'
 		cancelations: cancels,
 	})
 	processor := newProcessor(processorParams{
 		logger:            logger,
-		broker:            rdb,
+		broker:            b, // Use generic broker 'b'
 		retryDelayFunc:    delayFunc,
 		taskCheckInterval: taskCheckInterval,
 		baseCtxFn:         baseCtxFn,
@@ -560,7 +583,7 @@ func NewServerFromRedisClient(c redis.UniversalClient, cfg Config) *Server {
 	})
 	recoverer := newRecoverer(recovererParams{
 		logger:         logger,
-		broker:         rdb,
+		broker:         b, // Use generic broker 'b'
 		retryDelayFunc: delayFunc,
 		isFailureFunc:  isFailureFunc,
 		queues:         qnames,
@@ -568,7 +591,7 @@ func NewServerFromRedisClient(c redis.UniversalClient, cfg Config) *Server {
 	})
 	healthchecker := newHealthChecker(healthcheckerParams{
 		logger:          logger,
-		broker:          rdb,
+		broker:          b, // Use generic broker 'b'
 		interval:        healthcheckInterval,
 		healthcheckFunc: cfg.HealthCheckFunc,
 	})
@@ -588,14 +611,14 @@ func NewServerFromRedisClient(c redis.UniversalClient, cfg Config) *Server {
 	}
 	janitor := newJanitor(janitorParams{
 		logger:    logger,
-		broker:    rdb,
+		broker:    b, // Use generic broker 'b'
 		queues:    qnames,
 		interval:  janitorInterval,
 		batchSize: janitorBatchSize,
 	})
 	aggregator := newAggregator(aggregatorParams{
 		logger:          logger,
-		broker:          rdb,
+		broker:          b, // Use generic broker 'b'
 		queues:          qnames,
 		gracePeriod:     groupGracePeriod,
 		maxDelay:        cfg.GroupMaxDelay,
@@ -604,8 +627,8 @@ func NewServerFromRedisClient(c redis.UniversalClient, cfg Config) *Server {
 	})
 	return &Server{
 		logger:           logger,
-		broker:           rdb,
-		sharedConnection: true,
+		broker:           b, // Use generic broker 'b'
+		sharedConnection: sharedConn, // Use passed in sharedConn
 		state:            srvState,
 		forwarder:        forwarder,
 		processor:        processor,

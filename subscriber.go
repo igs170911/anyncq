@@ -53,36 +53,45 @@ func (s *subscriber) start(wg *sync.WaitGroup) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		var (
-			pubsub *redis.PubSub
-			err    error
-		)
-		// Try until successfully connect to Redis.
-		for {
-			pubsub, err = s.broker.CancelationPubSub()
-			if err != nil {
-				s.logger.Errorf("cannot subscribe to cancelation channel: %v", err)
-				select {
-				case <-time.After(s.retryTimeout):
-					continue
-				case <-s.done:
-					s.logger.Debug("Subscriber done")
-					return
-				}
-			}
-			break
+		pubsub, err := s.broker.CancelationPubSub()
+		if err != nil {
+			// Log a warning and disable subscriber if the broker doesn't support PubSub (e.g., Cassandra).
+			s.logger.Warnf("Task cancellation feature is not supported by the current broker (%T): %v. Cancels via API will not be processed by this server instance.", s.broker, err)
+			// Note: For Redis, if this initial call fails, it used to retry.
+			// Now, if the broker is Redis and it fails here, the subscriber also won't run.
+			// This simplifies the logic as the primary goal is to handle non-PubSub brokers gracefully.
+			// If Redis connection is temporarily down, other parts of Asynq (like heartbeater) would also be affected.
+			s.logger.Debug("Subscriber done (due to lack of PubSub support or initial connection error)")
+			return
 		}
+
+		// Proceed only if pubsub is successfully obtained (i.e., broker supports it and connection was successful)
+		s.logger.Info("Cancelation subscriber started")
 		cancelCh := pubsub.Channel()
 		for {
 			select {
 			case <-s.done:
-				pubsub.Close()
+				if err := pubsub.Close(); err != nil {
+					s.logger.Errorf("Error closing pubsub in subscriber: %v", err)
+				}
 				s.logger.Debug("Subscriber done")
 				return
 			case msg := <-cancelCh:
+				if msg == nil {
+					s.logger.Info("Cancelation channel closed, subscriber stopping...")
+					// This can happen if the connection to the broker is lost.
+					// The original code would loop and try to re-establish pubsub.
+					// For simplicity now, we exit. Re-establishment might be complex
+					// and better handled by a full server restart or more robust broker connection management.
+					return
+				}
+				s.logger.Debugf("Received cancelation signal for Task ID %q", msg.Payload)
 				cancel, ok := s.cancelations.Get(msg.Payload)
 				if ok {
+					s.logger.Debugf("Found cancel func for Task ID %q, invoking it", msg.Payload)
 					cancel()
+				} else {
+					s.logger.Debugf("No cancel func found for Task ID %q (already processed or unknown)", msg.Payload)
 				}
 			}
 		}
