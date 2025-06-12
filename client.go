@@ -11,7 +11,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/gocql/gocql"
 	"github.com/hibiken/asynq/internal/base"
+	"github.com/hibiken/asynq/internal/cdb"
 	"github.com/hibiken/asynq/internal/errors"
 	"github.com/hibiken/asynq/internal/rdb"
 	"github.com/redis/go-redis/v9"
@@ -45,6 +47,21 @@ func NewClient(r RedisConnOpt) *Client {
 // Warning: The underlying redis connection pool will not be closed by Asynq, you are responsible for closing it.
 func NewClientFromRedisClient(c redis.UniversalClient) *Client {
 	return &Client{broker: rdb.NewRDB(c), sharedConnection: true}
+}
+
+// NewClientFromCassandraSession returns a new instance of Client given a gocql.Session.
+// Warning: The underlying Cassandra session will not be closed by Asynq;
+// you are responsible for closing it.
+func NewClientFromCassandraSession(session *gocql.Session) *Client {
+	if session == nil {
+		// Or handle more gracefully, but for now, panic is clear.
+		panic("asynq: cassandra session cannot be nil")
+	}
+	cassandraBroker := cdb.NewCDB(session) // Assuming NewCDB is the constructor in cdb package
+	return &Client{
+		broker:           cassandraBroker,
+		sharedConnection: true, // true because the session is managed externally
+	}
 }
 
 type OptionType int
